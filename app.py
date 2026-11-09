@@ -31,6 +31,10 @@ from PIL import Image
 from camera import WebcamCapture
 from detector import PersonDetector
 
+# WebRTC support (streamlit-webrtc + processor defined in webrtc_processor.py)
+from streamlit_webrtc import webrtc_streamer, WebRtcMode, RTCConfiguration
+from webrtc_processor import ClassroomVideoProcessor
+
 # ---------------------------------------------------------------------------
 # CSV logging helpers  — UNCHANGED
 # ---------------------------------------------------------------------------
@@ -486,15 +490,22 @@ div[data-testid="stHorizontalBlock"] [data-testid="baseButton-primary"]:hover {
 # Session state defaults  — UNCHANGED
 # ---------------------------------------------------------------------------
 _DEFAULTS = {
-    "monitoring":        False,
-    "people_count":      0,
-    "history":           [],   # list of {"Time": str, "People": int}
-    "frame_count":       0,
-    "last_logged_frame": -1,   # tracks which frame was last written to CSV
-    "cam":               None, # WebcamCapture instance (kept open between reruns)
-    "detector":          None,
-    "detector_conf":     None,
-    "active_page":       "Dashboard",   # tracks which nav page is selected
+    "monitoring":                 False,
+    "people_count":               0,
+    "history":                    [],   # list of {"Time": str, "People": int}
+    "frame_count":                0,
+    "last_logged_frame":          -1,   # tracks which frame was last written to CSV
+    "cam":                        None, # WebcamCapture instance (kept open between reruns)
+    "detector":                   None,
+    "detector_conf":              None,
+    "active_page":                "Dashboard",   # tracks which nav page is selected
+    "camera_source":              "Local Webcam (OpenCV)",  # "Local Webcam (OpenCV)" or "Browser Webcam (WebRTC)"
+    # WebRTC-specific: last processor frame index consumed by the main thread
+    "webrtc_last_consumed_frame": -1,
+    # WebRTC-specific: last people count from a successful (error-free) frame
+    "webrtc_last_valid_count":    0,
+    # WebRTC-specific: True while waiting for browser to confirm stop on source switch
+    "webrtc_stopping":            False,
 }
 for _k, _v in _DEFAULTS.items():
     if _k not in st.session_state:
@@ -542,6 +553,29 @@ st.sidebar.markdown(
     unsafe_allow_html=True,
 )
 
+# --- Camera source selector ---
+# Switching source releases any open OpenCV webcam so it is not held idle.
+_source_options = ["Local Webcam (OpenCV)", "Browser Webcam (WebRTC)"]
+camera_source = st.sidebar.radio(
+    "Camera Source",
+    options=_source_options,
+    index=_source_options.index(st.session_state.camera_source),
+    key="camera_source_radio",
+    help="Choose how to access the camera.",
+)
+# If the user switches sources, release any open OpenCV webcam immediately
+# so it does not remain locked while WebRTC is active (and vice versa).
+if camera_source != st.session_state.camera_source:
+    if st.session_state.cam is not None:
+        st.session_state.cam.release()
+        st.session_state.cam = None
+    # If switching AWAY from WebRTC, keep the component rendered for one more
+    # rerun so desired_playing_state=False reaches the browser before unmounting.
+    if st.session_state.camera_source == "Browser Webcam (WebRTC)":
+        st.session_state.webrtc_stopping = True
+    st.session_state.camera_source = camera_source
+    st.session_state.monitoring    = False   # stop monitoring on source change
+
 capacity = st.sidebar.number_input(
     "Classroom Capacity",
     min_value=1, max_value=200, value=30, step=1,
@@ -554,10 +588,15 @@ confidence_threshold = st.sidebar.slider(
     help="Minimum confidence score for a person to be counted.",
 )
 
-camera_index = st.sidebar.number_input(
-    "Camera Index", min_value=0, max_value=5, value=0, step=1,
-    help="0 = built-in webcam. Try 1 or 2 for external webcams.",
-)
+# Camera Index only makes sense for the local OpenCV webcam.
+# Hide it when Browser WebRTC is selected.
+if camera_source == "Local Webcam (OpenCV)":
+    camera_index = st.sidebar.number_input(
+        "Camera Index", min_value=0, max_value=5, value=0, step=1,
+        help="0 = built-in webcam. Try 1 or 2 for external webcams.",
+    )
+else:
+    camera_index = 0   # unused for WebRTC; set a safe default
 
 # --- Monitoring controls — in sidebar, below Configuration ---
 st.sidebar.markdown("---")
@@ -568,6 +607,7 @@ st.sidebar.markdown(
 )
 
 # Start button — blue (primary type inherits the primary CSS above)
+# For WebRTC the button just sets monitoring=True; webrtc_streamer handles the stream.
 start_btn = st.sidebar.button(
     "▶  Start Monitoring",
     key="sidebar_start_btn",
@@ -575,7 +615,7 @@ start_btn = st.sidebar.button(
     type="primary",
 )
 
-# Stop button — red (wrap in a div so CSS can target it by class)
+# Stop button — red
 st.sidebar.markdown('<div class="sidebar-stop-btn">', unsafe_allow_html=True)
 stop_btn = st.sidebar.button(
     "⏹  Stop Monitoring",
@@ -584,22 +624,31 @@ stop_btn = st.sidebar.button(
 )
 st.sidebar.markdown('</div>', unsafe_allow_html=True)
 
-# --- Handle monitoring button clicks (identical logic, now in sidebar) ---
+# --- Handle monitoring button clicks ---
 if start_btn:
-    st.session_state.monitoring  = True
-    st.session_state.history     = []
-    st.session_state.frame_count = 0
+    # Guard: if a WebRTC stop transition is in progress, do not start a new
+    # monitoring session yet.  The transition clears itself within one rerun
+    # once the browser confirms the peer connection has stopped.
+    if st.session_state.webrtc_stopping:
+        st.sidebar.warning("⏳ Waiting for WebRTC to stop — please try again in a moment.")
+    else:
+        st.session_state.monitoring  = True
+        st.session_state.history     = []
+        st.session_state.frame_count = 0
 
-    if st.session_state.cam is None or not st.session_state.cam.is_open:
-        _cam = WebcamCapture(camera_index=int(camera_index))
-        if _cam.open():
-            st.session_state.cam = _cam
-        else:
-            st.session_state.monitoring = False
-            st.sidebar.error(f"❌ Webcam error: {_cam.error}")
+        # Only open the OpenCV webcam here; WebRTC opens its own stream automatically
+        if camera_source == "Local Webcam (OpenCV)":
+            if st.session_state.cam is None or not st.session_state.cam.is_open:
+                _cam = WebcamCapture(camera_index=int(camera_index))
+                if _cam.open():
+                    st.session_state.cam = _cam
+                else:
+                    st.session_state.monitoring = False
+                    st.sidebar.error(f"❌ Webcam error: {_cam.error}")
 
 if stop_btn:
     st.session_state.monitoring = False
+    # Release OpenCV webcam if it is open (WebRTC stream stops via its own component)
     if st.session_state.cam is not None:
         st.session_state.cam.release()
         st.session_state.cam = None
@@ -821,16 +870,114 @@ if _page == "Dashboard":
             use_container_width=True,
         )
 
-    # ---- IDLE state ----
+    # ===========================================================================
+    # WebRTC component — rendered unconditionally when Browser WebRTC is
+    # selected, regardless of monitoring state.
+    #
+    # WHY: desired_playing_state=False must reach the browser component while
+    # it is still mounted in the DOM.  If the component is only rendered inside
+    # the `else: # active monitoring` block it disappears from the DOM the
+    # moment monitoring stops, so the explicit stop prop never arrives.
+    # Rendering it here (always, for the WebRTC source) means:
+    #   • monitoring=False  → component rendered, desired_playing_state=False
+    #                         → browser receives stop signal → camera released.
+    #   • monitoring=True   → component rendered, desired_playing_state=True
+    #                         → browser starts camera automatically.
+    #   • source = OpenCV   → component is NOT rendered at all (guarded below).
+    # ===========================================================================
+    _webrtc_ctx = None   # default; set only when WebRTC source is active
+
+    if camera_source == "Browser Webcam (WebRTC)" or st.session_state.webrtc_stopping:
+        _RTC_CONFIG = RTCConfiguration(
+            iceServers=[{"urls": ["stun:stun.l.google.com:19302",
+                                  "stun:stun1.l.google.com:19302"]}]
+        )
+
+        # Detector must exist before the processor factory runs.
+        # Load it now (outside the monitoring gate) so the factory closure
+        # always has a valid reference.  If the model is not yet loaded and
+        # monitoring is off, skip rendering the component.
+        if st.session_state.detector is None or st.session_state.detector_conf != confidence_threshold:
+            if st.session_state.monitoring:
+                # Only block-load the model when the user has actually started
+                # monitoring; otherwise leave _webrtc_ctx as None.
+                with st.spinner("⏳ Loading YOLO model…"):
+                    try:
+                        st.session_state.detector      = PersonDetector(
+                            model_path="yolo11n.pt",
+                            confidence=confidence_threshold,
+                        )
+                        st.session_state.detector_conf = confidence_threshold
+                    except Exception as exc:
+                        st.error(f"❌ Model load failed: {exc}")
+                        st.session_state.monitoring = False
+
+        # Only render the component when a detector is available (or monitoring
+        # is off and we want desired_playing_state=False to reach a previously
+        # live component).
+        _det_for_webrtc = st.session_state.detector
+
+        if _det_for_webrtc is not None:
+            _det_ref = _det_for_webrtc  # local alias captured by closure
+
+            def _make_processor() -> ClassroomVideoProcessor:
+                return ClassroomVideoProcessor(_det_ref)
+
+            with video_placeholder:
+                # Render inside the left-column video placeholder so it
+                # appears where the feed belongs in the layout.
+                _webrtc_ctx = webrtc_streamer(
+                    key="classroom_webrtc",
+                    mode=WebRtcMode.SENDRECV,
+                    rtc_configuration=_RTC_CONFIG,
+                    video_processor_factory=_make_processor,
+                    media_stream_constraints={"video": True, "audio": False},
+                    async_processing=True,
+                    # This prop is forwarded to the browser component on every
+                    # render.  When monitoring stops, the component is still
+                    # mounted and receives False → browser stops the camera
+                    # and closes the peer connection cleanly.
+                    desired_playing_state=st.session_state.monitoring,
+                )
+
+            # ── Stop-transition guard ──────────────────────────────────────
+            # During a source switch (webrtc_stopping=True), keep the component
+            # rendered until the browser confirms it has stopped.
+            # state.playing=False arrives synchronously with track.stop() (at
+            # STOPPING dispatch); state.signalling=False confirms no offer pending.
+            # This is the only Python-observable completion signal in this library.
+            if (st.session_state.webrtc_stopping
+                    and _webrtc_ctx is not None
+                    and not _webrtc_ctx.state.playing
+                    and not _webrtc_ctx.state.signalling):
+                st.session_state.webrtc_stopping = False
+                st.rerun()
+
+        else:
+            # ── Detector-absent escape hatch ───────────────────────────────
+            # webrtc_stopping=True but the detector was never loaded, meaning
+            # the WebRTC component was never rendered and the browser camera
+            # was never opened.  There is nothing to wait for — clear the flag
+            # immediately so the app does not loop indefinitely.
+            if st.session_state.webrtc_stopping:
+                st.session_state.webrtc_stopping = False
+                st.rerun()
+
+    # ---- IDLE state (OpenCV source, or WebRTC source but not yet monitoring) ----
     if not st.session_state.monitoring:
-        video_placeholder.markdown("""
-        <div class="video-idle">
-            <div class="video-idle-icon">📷</div>
-            <div class="video-idle-title">Webcam is Off</div>
-            <div class="video-idle-sub">
-                Click <strong>▶ Start Monitoring</strong> in the sidebar to begin
-            </div>
-        </div>""", unsafe_allow_html=True)
+        # For OpenCV: show the idle placeholder inside the video column.
+        # For WebRTC: the component above is already rendered in video_placeholder;
+        #             it shows its own idle/stopped UI driven by desired_playing_state=False.
+        #             Only fill the placeholder for OpenCV source.
+        if camera_source == "Local Webcam (OpenCV)":
+            video_placeholder.markdown("""
+            <div class="video-idle">
+                <div class="video-idle-icon">📷</div>
+                <div class="video-idle-title">Webcam is Off</div>
+                <div class="video-idle-sub">
+                    Click <strong>▶ Start Monitoring</strong> in the sidebar to begin
+                </div>
+            </div>""", unsafe_allow_html=True)
 
         count_bar_placeholder.markdown(
             '<div class="people-count-bar">👥 0 people detected</div>',
@@ -854,8 +1001,11 @@ if _page == "Dashboard":
 
         render_log_section()
 
-    # ---- ACTIVE MONITORING — one frame per rerun — BACKEND UNCHANGED ----
+    # ---- ACTIVE MONITORING — branches by camera source ----
     else:
+        # ==============================================================
+        # Shared: ensure the YOLO detector is loaded (both branches use it)
+        # ==============================================================
         if (st.session_state.detector is None
                 or st.session_state.detector_conf != confidence_threshold):
             with st.spinner("⏳ Loading YOLO model…"):
@@ -877,56 +1027,186 @@ if _page == "Dashboard":
             st.session_state.monitoring = False
             st.stop()
 
-        cam: WebcamCapture | None = st.session_state.cam
-        if cam is None or not cam.is_open:
-            cam = WebcamCapture(camera_index=int(camera_index))
-            if not cam.open():
-                st.error(f"❌ {cam.error}")
-                st.session_state.monitoring = False
-                st.stop()
-            st.session_state.cam = cam
+        # ==============================================================
+        # BRANCH A — LOCAL WEBCAM (OpenCV) — original logic, UNCHANGED
+        # ==============================================================
+        if camera_source == "Local Webcam (OpenCV)":
+            cam: WebcamCapture | None = st.session_state.cam
+            if cam is None or not cam.is_open:
+                cam = WebcamCapture(camera_index=int(camera_index))
+                if not cam.open():
+                    st.error(f"❌ {cam.error}")
+                    st.session_state.monitoring = False
+                    st.stop()
+                st.session_state.cam = cam
 
-        ok, frame = cam.read_frame()
-        if not ok:
-            st.warning("⚠️ Could not read frame from webcam — retrying…")
+            ok, frame = cam.read_frame()
+            if not ok:
+                st.warning("⚠️ Could not read frame from webcam — retrying…")
+                time.sleep(0.05)
+                st.rerun()
+
+            annotated, count, _ = detector.detect(frame)
+            st.session_state.people_count  = count
+            st.session_state.frame_count  += 1
+
+            st.session_state.history.append({
+                "Time":   pd.Timestamp.now().strftime("%H:%M:%S"),
+                "People": count,
+            })
+            if len(st.session_state.history) > 60:
+                st.session_state.history.pop(0)
+
+            rgb = cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB)
+            video_placeholder.image(Image.fromarray(rgb), channels="RGB", use_container_width=True)
+
+            count_bar_placeholder.markdown(
+                f'<div class="people-count-bar">👥 {count} {"person" if count == 1 else "people"} detected</div>',
+                unsafe_allow_html=True,
+            )
+
+            render_metrics(count, int(capacity))
+
+            df = pd.DataFrame(st.session_state.history)
+            chart_placeholder.line_chart(df.set_index("Time")["People"])
+
+            if st.session_state.frame_count != st.session_state.last_logged_frame:
+                pct_now, status_now, _ = compute_occupancy(count, int(capacity))
+                log_to_csv(count, int(capacity), pct_now, status_now)
+                st.session_state.last_logged_frame = st.session_state.frame_count
+
+            render_log_section()
+
+            st.sidebar.caption(f"🎞️ Frame #{st.session_state.frame_count} | 👥 {count} detected")
+
             time.sleep(0.05)
             st.rerun()
 
-        annotated, count, _ = detector.detect(frame)
-        st.session_state.people_count  = count
-        st.session_state.frame_count  += 1
+        # ==============================================================
+        # BRANCH B — BROWSER WEBCAM (WebRTC)
+        # ==============================================================
+        # The webrtc_streamer component was already rendered above the
+        # idle/active gate (so it stays mounted and receives
+        # desired_playing_state=False when monitoring stops).
+        # _webrtc_ctx is set there; use it directly in the fragment.
+        else:
+            # ------------------------------------------------------------------
+            # Periodic dashboard refresh — @st.fragment(run_every=1) re-executes
+            # only this inner block once per second without triggering a full-page
+            # rerun. This keeps the main Streamlit thread unblocked and prevents
+            # any conflict with the WebRTC event loop.
+            # The fragment captures _webrtc_ctx, capacity, and all placeholders
+            # from the enclosing scope via closure — no arguments needed.
+            # ------------------------------------------------------------------
+            @st.fragment(run_every=1)
+            def _webrtc_dashboard_fragment():
+                # ── Stream is live ──────────────────────────────────────────
+                if (_webrtc_ctx
+                        and _webrtc_ctx.state.playing
+                        and _webrtc_ctx.video_processor):
 
-        st.session_state.history.append({
-            "Time":   pd.Timestamp.now().strftime("%H:%M:%S"),
-            "People": count,
-        })
-        if len(st.session_state.history) > 60:
-            st.session_state.history.pop(0)
+                    _proc = _webrtc_ctx.video_processor
 
-        rgb = cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB)
-        video_placeholder.image(Image.fromarray(rgb), channels="RGB", use_container_width=True)
+                    # Thread-safe snapshot from the background processor thread.
+                    _count, _frames, _err = _proc.get_snapshot()
 
-        count_bar_placeholder.markdown(
-            f'<div class="people-count-bar">👥 {count} {"person" if count == 1 else "people"} detected</div>',
-            unsafe_allow_html=True,
-        )
+                    # ── Error handling ───────────────────────────────────────
+                    # On inference error: show warning, keep the last valid count,
+                    # do NOT append to history, do NOT log to CSV.
+                    if _err:
+                        st.warning(f"⚠️ Detection error: {_err}")
+                        # Restore the last successfully detected count so the
+                        # dashboard does not incorrectly show zero.
+                        _display_count = st.session_state.webrtc_last_valid_count
+                    else:
+                        _display_count = _count
+                        # Persist the good count for future error recovery.
+                        st.session_state.webrtc_last_valid_count = _count
 
-        render_metrics(count, int(capacity))
+                    # ── Duplicate-frame guard ────────────────────────────────
+                    # Only update history / CSV when the processor has emitted a
+                    # frame we have not yet consumed (frame counter advanced).
+                    _new_frame = (
+                        _frames > st.session_state.webrtc_last_consumed_frame
+                        and _frames > 0
+                        and not _err          # never record a failed frame
+                    )
 
-        df = pd.DataFrame(st.session_state.history)
-        chart_placeholder.line_chart(df.set_index("Time")["People"])
+                    if _new_frame:
+                        # Update rolling session-state counters
+                        st.session_state.people_count  = _display_count
+                        st.session_state.frame_count   = _frames
+                        st.session_state.webrtc_last_consumed_frame = _frames
 
-        if st.session_state.frame_count != st.session_state.last_logged_frame:
-            pct_now, status_now, _ = compute_occupancy(count, int(capacity))
-            log_to_csv(count, int(capacity), pct_now, status_now)
-            st.session_state.last_logged_frame = st.session_state.frame_count
+                        # Append to rolling 60-entry history
+                        st.session_state.history.append({
+                            "Time":   pd.Timestamp.now().strftime("%H:%M:%S"),
+                            "People": _display_count,
+                        })
+                        if len(st.session_state.history) > 60:
+                            st.session_state.history.pop(0)
 
-        render_log_section()
+                        # CSV — only from the main Streamlit thread (here), never
+                        # from the WebRTC background callback.
+                        if _frames != st.session_state.last_logged_frame:
+                            pct_now, status_now, _ = compute_occupancy(
+                                _display_count, int(capacity)
+                            )
+                            log_to_csv(_display_count, int(capacity), pct_now, status_now)
+                            st.session_state.last_logged_frame = _frames
 
-        st.sidebar.caption(f"🎞️ Frame #{st.session_state.frame_count} | 👥 {count} detected")
+                    # ── UI updates (every fragment run, not just new frames) ──
+                    # Always reflect the best available count even if no new frame.
+                    _ui_count = st.session_state.people_count
 
-        time.sleep(0.05)
-        st.rerun()
+                    count_bar_placeholder.markdown(
+                        f'<div class="people-count-bar">👥 {_ui_count} '
+                        f'{"person" if _ui_count == 1 else "people"} detected</div>',
+                        unsafe_allow_html=True,
+                    )
+
+                    render_metrics(_ui_count, int(capacity))
+
+                    if st.session_state.history:
+                        df = pd.DataFrame(st.session_state.history)
+                        chart_placeholder.line_chart(df.set_index("Time")["People"])
+
+                    st.sidebar.caption(
+                        f"🎞️ Frame #{_frames} | 👥 {_ui_count} detected (WebRTC)"
+                    )
+
+                # ── Stream not yet playing / stopped ────────────────────────
+                else:
+                    _status_label = (
+                        "🌐 Waiting for browser camera…"
+                        if st.session_state.monitoring
+                        else "⚫ Monitoring Off"
+                    )
+
+                    count_bar_placeholder.markdown(
+                        '<div class="people-count-bar">👥 — awaiting stream</div>',
+                        unsafe_allow_html=True,
+                    )
+                    metric_status.markdown(
+                        _status_pill(_status_label, "status-off"),
+                        unsafe_allow_html=True,
+                    )
+                    metric_rows.markdown(
+                        _metric_row("👥 People Detected",    "—")
+                        + _metric_row("🏫 Classroom Capacity", int(capacity))
+                        + _metric_row("🪑 Available Seats",    int(capacity))
+                        + _metric_row("📊 Occupancy %",        "—"),
+                        unsafe_allow_html=True,
+                    )
+                    progress_bar.markdown(_progress_bar(0), unsafe_allow_html=True)
+                    for _ph in (metric_people, metric_capacity, metric_avail, metric_pct):
+                        _ph.markdown("", unsafe_allow_html=True)
+
+                render_log_section()
+
+            # Execute the fragment immediately on this rerun so placeholders are
+            # filled even before the first periodic tick fires.
+            _webrtc_dashboard_fragment()
 
 # ---------------------------------------------------------------------------
 # PAGE: ANALYTICS
